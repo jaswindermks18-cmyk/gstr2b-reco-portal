@@ -19,11 +19,15 @@ What it does
 Run:  python gst_2b_reco.py
 """
 
+import json
 import os
 import re
 import smtplib
+import ssl
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
@@ -105,6 +109,11 @@ CONFIG = {
     # The password itself is never written in this file.
     "ENV_SENDER_EMAIL": "GST_SENDER_EMAIL",
     "ENV_APP_PASSWORD": "GST_APP_PASSWORD",
+    # Optional: if this variable holds a Brevo API key, emails are sent through
+    # Brevo's web API (HTTPS) instead of Gmail SMTP. Use it on hosts or networks
+    # that block SMTP. The sender email must be verified in the Brevo account.
+    "ENV_BREVO_API_KEY": "BREVO_API_KEY",
+    "BREVO_API_URL": "https://api.brevo.com/v3/smtp/email",
 }
 
 AMOUNT_FIELDS = ["taxable", "igst", "cgst", "sgst"]
@@ -542,13 +551,54 @@ def connect_smtp():
     if not sender or not password:
         return None, sender, (f"Environment variables {CONFIG['ENV_SENDER_EMAIL']} and "
                               f"{CONFIG['ENV_APP_PASSWORD']} are not set")
+    # Try the normal port (587, STARTTLS) first. Some networks and hosts close
+    # that connection, so fall back to port 465 (SSL) before giving up.
+    host, errors = CONFIG["SMTP_SERVER"], []
+    for method, port in (("starttls", CONFIG["SMTP_PORT"]), ("ssl", 465)):
+        try:
+            context = ssl.create_default_context()
+            if method == "ssl":
+                server = smtplib.SMTP_SSL(host, port, timeout=30, context=context)
+            else:
+                server = smtplib.SMTP(host, port, timeout=30)
+                server.ehlo()
+                server.starttls(context=context)
+                server.ehlo()
+            server.login(sender, password)
+            return server, sender, None
+        except smtplib.SMTPAuthenticationError as err:
+            # Wrong email or app password - the other port will not help
+            return None, sender, f"Gmail login failed (check email and app password): {err}"
+        except Exception as err:
+            errors.append(f"port {port}: {err}")
+    return None, sender, "Gmail login failed: " + "; ".join(errors)
+
+
+def send_via_brevo(api_key, sender, to_address, subject, html, text):
+    """Send one email through Brevo's web API. Raises an error if it fails."""
+    payload = {
+        "sender": {"name": CONFIG["FIRM_NAME"], "email": sender},
+        "replyTo": {"email": sender},
+        "to": [{"email": to_address}],
+        "subject": subject,
+        "htmlContent": html,
+        "textContent": text,
+    }
+    if CONFIG["CC_EMAIL"]:
+        payload["cc"] = [{"email": CONFIG["CC_EMAIL"]}]
+    request = urllib.request.Request(
+        CONFIG["BREVO_API_URL"],
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"api-key": api_key, "content-type": "application/json",
+                 "accept": "application/json"},
+        method="POST",
+    )
     try:
-        server = smtplib.SMTP(CONFIG["SMTP_SERVER"], CONFIG["SMTP_PORT"], timeout=30)
-        server.starttls()
-        server.login(sender, password)
-        return server, sender, None
-    except Exception as err:
-        return None, sender, f"Gmail login failed: {err}"
+        with urllib.request.urlopen(request, timeout=30) as response:
+            response.read()
+    except urllib.error.HTTPError as err:
+        detail = err.read().decode("utf-8", errors="replace")[:300]
+        raise RuntimeError(f"Brevo error {err.code}: {detail}") from None
 
 
 def send_vendor_emails(not_in_2b, vendor_emails):
@@ -561,8 +611,13 @@ def send_vendor_emails(not_in_2b, vendor_emails):
     dry_run = CONFIG["DRY_RUN"]
     preview_folder = Path(CONFIG["EMAIL_PREVIEW_FOLDER"])
     server, sender, login_error = (None, "", None)
+    brevo_key = os.environ.get(CONFIG["ENV_BREVO_API_KEY"], "").strip()
     if dry_run:
         preview_folder.mkdir(exist_ok=True)
+    elif brevo_key:
+        sender = os.environ.get(CONFIG["ENV_SENDER_EMAIL"], "").strip()
+        if not sender:
+            login_error = f"Environment variable {CONFIG['ENV_SENDER_EMAIL']} is not set"
     else:
         server, sender, login_error = connect_smtp()
         if login_error:
@@ -590,15 +645,20 @@ def send_vendor_emails(not_in_2b, vendor_emails):
                 if not first_email:
                     time.sleep(CONFIG["SECONDS_BETWEEN_EMAILS"])
                 first_email = False
-                message = EmailMessage()
-                message["Subject"] = email_subject()
-                message["From"] = sender
-                message["To"] = to_address
-                if CONFIG["CC_EMAIL"]:
-                    message["Cc"] = CONFIG["CC_EMAIL"]
-                message.set_content(email_plain_text(vendor, gstin, invoices))
-                message.add_alternative(email_html(vendor, gstin, invoices), subtype="html")
-                server.send_message(message)
+                html = email_html(vendor, gstin, invoices)
+                text = email_plain_text(vendor, gstin, invoices)
+                if brevo_key:
+                    send_via_brevo(brevo_key, sender, to_address, email_subject(), html, text)
+                else:
+                    message = EmailMessage()
+                    message["Subject"] = email_subject()
+                    message["From"] = sender
+                    message["To"] = to_address
+                    if CONFIG["CC_EMAIL"]:
+                        message["Cc"] = CONFIG["CC_EMAIL"]
+                    message.set_content(text)
+                    message.add_alternative(html, subtype="html")
+                    server.send_message(message)
                 status = "Sent"
             except Exception as err:
                 status = f"Failed - {err}"
