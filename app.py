@@ -8,9 +8,7 @@ Settings (never written in this file) are read from Streamlit secrets
 (.streamlit/secrets.toml) or, if not found there, from environment variables:
 
     GST_SENDER_EMAIL   the mailbox the emails are sent from
-    GST_APP_PASSWORD   the app password of that mailbox (Gmail SMTP route)
-    BREVO_API_KEY      optional - if set, emails go through Brevo's web API
-                       instead of Gmail SMTP (for hosts that block SMTP)
+    GST_APP_PASSWORD   the app password of that mailbox
     PORTAL_USERS       logins for the portal, e.g.  "admin:Pass@123,staff:Pass@456"
                        (in secrets.toml you can use a [users] table instead)
 """
@@ -233,21 +231,17 @@ def email_section(result):
     # ---- Send ----------------------------------------------------------------
     sender = str(setting("GST_SENDER_EMAIL")).strip()
     password = str(setting("GST_APP_PASSWORD")).strip()
-    brevo_key = str(setting("BREVO_API_KEY")).strip()
-    if not sender or not (password or brevo_key):
-        st.error("Sending is switched off: set GST_SENDER_EMAIL and either "
-                 "BREVO_API_KEY or GST_APP_PASSWORD in the secrets.")
+    if not sender or not password:
+        st.error("Sending is switched off: GST_SENDER_EMAIL and GST_APP_PASSWORD are not set.")
         return
 
-    route = "Brevo" if brevo_key else "Gmail SMTP"
-    st.write(f"Emails will be sent from **{sender}** through {route}.")
+    st.write(f"Emails will be sent from **{sender}**.")
     test_mode = st.checkbox(f"Test mode: send every email to {sender} instead of the vendor",
                             value=True)
     confirm = st.checkbox(f"I have checked the preview. Send {len(selected)} email(s).")
     if st.button("Send emails", type="primary", disabled=not confirm or selected.empty):
         os.environ[reco.CONFIG["ENV_SENDER_EMAIL"]] = sender
         os.environ[reco.CONFIG["ENV_APP_PASSWORD"]] = password
-        os.environ[reco.CONFIG["ENV_BREVO_API_KEY"]] = brevo_key
         reco.CONFIG["DRY_RUN"] = False
         to_send = not_in_2b[not_in_2b["GSTIN"].isin(selected["GSTIN"])]
         addresses = ({g: sender for g in selected["GSTIN"]} if test_mode
